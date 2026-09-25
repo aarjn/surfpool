@@ -100,6 +100,8 @@ docker run --rm \
 
 For fully custom externally visible URLs, such as TLS termination or remapped ports, override `SURFPOOL_PUBLIC_RPC_URL`, `SURFPOOL_PUBLIC_WS_URL`, and `SURFPOOL_PUBLIC_STUDIO_URL`.
 
+To host Surfpool as a shared, API-key-protected RPC endpoint (HTTPS + WSS) on [Railway](https://railway.com), see [railway/README.md](railway/README.md).
+
 Verify installation:
 
 ```console

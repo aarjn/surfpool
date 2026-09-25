@@ -1,0 +1,57 @@
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+(rpc_proxy) {
+	# Case-insensitive: browsers send "Upgrade: websocket", Node/undici
+	# sends lowercase variants; Caddy's plain header matcher is
+	# case-sensitive on values.
+	@websocket header_regexp ws_upgrade Upgrade (?i)^websocket$
+	reverse_proxy @websocket 127.0.0.1:8900
+
+	reverse_proxy 127.0.0.1:8899 {
+		# surfpool's RPC server emits no CORS headers; set (not add) so a
+		# future upstream value can't produce duplicates.
+		header_down Access-Control-Allow-Origin "*"
+	}
+}
+
+# Routes both HTTP JSON-RPC and WebSocket pubsub through Railway's single
+# public port, gated by an API key. Railway's edge terminates TLS, so the
+# same domain serves https:// and wss://.
+#
+# The key is accepted as `?api-key=<key>` (works for browser WebSockets,
+# which cannot set headers) or as an `x-api-key` header.
+:{$PORT:8080} {
+	# Railway healthcheck — no API key required.
+	handle /health {
+		respond "ok" 200
+	}
+
+	# CORS preflights carry no credentials, so they pass without a key.
+	@preflight method OPTIONS
+	handle @preflight {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		header Access-Control-Allow-Headers "*"
+		header Access-Control-Max-Age "86400"
+		respond "" 204
+	}
+
+	@key_query query api-key={$RPC_API_KEY}
+	handle @key_query {
+		import rpc_proxy
+	}
+
+	@key_header header x-api-key {$RPC_API_KEY}
+	handle @key_header {
+		import rpc_proxy
+	}
+
+	handle {
+		header Content-Type application/json
+		respond `{"jsonrpc":"2.0","error":{"code":-32001,"message":"unauthorized: pass ?api-key=<key> in the URL or an x-api-key header"},"id":null}` 401
+	}
+}
