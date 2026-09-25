@@ -21,7 +21,13 @@ for Railway's healthcheck. Railway's edge terminates TLS, so one domain gives yo
 
 1. Push this repo (with the `railway/` directory and root `railway.json`) to GitHub.
 2. In Railway: **New Project → Deploy from GitHub repo** and pick the repo.
-   `railway.json` makes it build `railway/Dockerfile` automatically.
+   `railway.json` picks the Dockerfile automatically. Two variants exist:
+   - `railway/Dockerfile.source` (current default) — compiles surfpool from this
+     repo, so local patches (e.g. the datasource retry fix in
+     `crates/core/src/surfnet/remote.rs`) are included. Builds take 20-40 min.
+   - `railway/Dockerfile` — layers the proxy on the prebuilt `surfpool/surfpool`
+     Docker Hub image. Builds in seconds but only runs released surfpool code.
+     Switch `dockerfilePath` in `railway.json` to use it.
 3. In the service **Variables** tab, set:
 
    | Variable | Required | Purpose |
@@ -99,15 +105,33 @@ Anchor (`Anchor.toml`):
 cluster = "https://<your-domain>/?api-key=<key>"
 ```
 
-Program-deploy notes:
+### Program deploys
 
+**Recommended: the cheatcode deployer.** `solana program deploy` sends ~1 transaction
+per KB of program; on a small hosted container that flood causes multi-second server
+stalls, and any response slower than the CLI's ~30s timeout aborts the deploy with
+`Error: ... error sending request for url (...)` (retrying can succeed — it's flaky,
+not broken, and already-sent transactions do land). `write-program.py` instead installs
+the program through surfpool's `surfnet_writeProgram` cheatcode in a few large RPC
+calls — sub-second and reliable:
+
+```sh
+python3 railway/write-program.py target/deploy/my_program.so \
+    target/deploy/my_program-keypair.json \
+    "https://<your-domain>/?api-key=<key>" \
+    <upgrade-authority pubkey or keypair.json>
+```
+
+If you prefer the standard CLI path anyway:
+
+- Retry on `error sending request` failures, and consider raising the service's
+  CPU/memory on Railway — the stalls are load-related.
 - The CLI derives the WebSocket URL from the HTTP URL. With the Railway domain
   (no explicit port) this resolves correctly to `wss://<your-domain>/?api-key=<key>`.
   If you ever use a URL with an explicit port (e.g. local testing on `:8080`), the CLI
   assumes WS is on port+1 — pass `--ws "ws://<host>:<port>/?api-key=<key>"` explicitly.
-- If a deploy misbehaves, add `--use-rpc` (`anchor deploy -- --use-rpc`) to force all
-  write transactions over the HTTP RPC instead of the TPU client. Both modes were
-  verified working against this setup.
+- `--use-rpc` (`anchor deploy -- --use-rpc`) forces write transactions over HTTP
+  instead of the TPU client; it does not avoid the stall-timeout issue.
 
 ## Notes
 

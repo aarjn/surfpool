@@ -1,0 +1,53 @@
+# Railway image that builds surfpool FROM THIS REPO'S SOURCE instead of the
+# prebuilt Docker Hub image — use it to ship local patches (see railway.json's
+# dockerfilePath). Expect a 20-40 minute build on Railway; the prebuilt
+# variant (railway/Dockerfile) deploys in seconds but only runs released code.
+
+FROM rust:bookworm AS build
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  pkg-config \
+  libssl-dev \
+  libclang-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . /src/surfpool
+
+WORKDIR /src/surfpool/
+
+RUN cargo build --release --bin surfpool --locked
+
+FROM caddy:2 AS caddy
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  curl \
+  libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/surfpool/target/release/surfpool /bin/surfpool
+COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
+
+COPY railway/Caddyfile /etc/caddy/Caddyfile
+COPY railway/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+
+# Bind surfpool to loopback only — the API-key proxy is the sole way in.
+ENV SURFPOOL_NETWORK_HOST=127.0.0.1
+
+WORKDIR /workspace
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+  CMD curl --fail --silent --output /dev/null \
+    --header 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+    http://127.0.0.1:8899
+
+ENTRYPOINT ["/usr/local/bin/start.sh"]

@@ -51,9 +51,18 @@ use crate::{
 /// Without this outer deadline, the HTTP timeout applies per attempt,
 /// so Solana retry/backoff handling can keep a datasource call alive
 /// for up to ten minutes.
-const DATASOURCE_DEADLINE: Duration = Duration::from_secs(60);
-const DATASOURCE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// The deadline must stay under the 30 seconds a stock Solana CLI waits
+/// for an RPC response: datasource fetches happen synchronously inside
+/// transaction processing, so a datasource call that outlives the
+/// caller's timeout turns a slow fetch into a client-side abort (a
+/// `solana program deploy` dies on the transaction that creates its
+/// buffer account).
+const DATASOURCE_DEADLINE: Duration = Duration::from_secs(25);
+const DATASOURCE_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const DATASOURCE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const DATASOURCE_RETRY_ATTEMPTS: usize = 3;
+const DATASOURCE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
     let endpoint =
@@ -109,6 +118,82 @@ fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
             ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
                 if message.contains("could not find mint")
         )
+}
+
+/// A transport failure worth a fresh attempt: the request never produced an
+/// application-level answer (timeout, connection failure, I/O error) or the
+/// datasource answered with a 5xx. RPC-level errors pass through untouched.
+/// Everything sent through this client is a read, so a retry can only trade
+/// a spurious failure for a correct answer.
+fn is_transient_transport_error(error: &ClientError) -> bool {
+    match error.kind() {
+        ClientErrorKind::Reqwest(error) => {
+            error.is_timeout()
+                || error.is_connect()
+                || error
+                    .status()
+                    .is_some_and(|status| status.is_server_error())
+        }
+        ClientErrorKind::Io(_) => true,
+        _ => false,
+    }
+}
+
+/// Retries transient transport failures on a fresh connection. A datasource
+/// that throttles by stalling or dropping a connection (the public mainnet
+/// RPC does both) fails one attempt, not the whole call — and with it the
+/// transaction whose account fetch is riding on that call.
+struct RetrySender<S> {
+    inner: S,
+    attempts: usize,
+    backoff: Duration,
+}
+
+impl<S> RetrySender<S> {
+    fn new(inner: S, attempts: usize, backoff: Duration) -> Self {
+        RetrySender {
+            inner,
+            attempts,
+            backoff,
+        }
+    }
+}
+
+#[async_trait]
+impl<S: RpcSender + Send + Sync> RpcSender for RetrySender<S> {
+    async fn send(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+    ) -> ClientResult<serde_json::Value> {
+        let mut last_error = None;
+        for attempt in 1..=self.attempts {
+            if attempt > 1 {
+                tokio::time::sleep(self.backoff).await;
+            }
+            match self.inner.send(request, params.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < self.attempts && is_transient_transport_error(&error) => {
+                    warn!(
+                        "datasource attempt {attempt}/{} for {request:?} failed transiently: {}; retrying",
+                        self.attempts,
+                        sanitized_client_error(&error, &self.inner.url()),
+                    );
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("retry loop always records an error before exhausting attempts"))
+    }
+
+    fn get_transport_stats(&self) -> RpcTransportStats {
+        self.inner.get_transport_stats()
+    }
+
+    fn url(&self) -> String {
+        self.inner.url()
+    }
 }
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
@@ -173,7 +258,11 @@ impl SurfpoolRpcClient {
             .pool_idle_timeout(DATASOURCE_POOL_IDLE_TIMEOUT)
             .build()?;
         let sender = DeadlineSender::new(
-            HttpSender::new_with_client(remote_rpc_url, client),
+            RetrySender::new(
+                HttpSender::new_with_client(remote_rpc_url, client),
+                DATASOURCE_RETRY_ATTEMPTS,
+                DATASOURCE_RETRY_BACKOFF,
+            ),
             DATASOURCE_DEADLINE,
         );
         let client = RpcClient::new_sender(
